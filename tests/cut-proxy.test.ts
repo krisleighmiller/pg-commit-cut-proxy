@@ -3,15 +3,17 @@ import net from "node:net";
 import { CutProxy } from "../src/cut-proxy.js";
 
 /**
- * A minimal mock PostgreSQL server that speaks the basic frontend wire protocol:
- * 1. Accepts StartupMessage
- * 2. Emits AuthenticationOk ('R') and ReadyForQuery ('Z')
- * 3. Handles SimpleQuery ('Q') messages
+ * A mock PostgreSQL server that speaks the basic frontend wire protocol:
+ * 1. Accepts SSLRequest (code 80877103) and replies 'N' (refused)
+ * 2. Accepts StartupMessage
+ * 3. Emits AuthenticationOk ('R') and ReadyForQuery ('Z')
+ * 4. Handles SimpleQuery ('Q') messages
  */
 class MockPostgresServer {
   private server: net.Server;
   readonly receivedQueries: string[] = [];
   readonly connections = new Set<net.Socket>();
+  sslRequestsHandled = 0;
 
   private constructor() {
     this.server = net.createServer((socket) => this.handleClient(socket));
@@ -41,6 +43,7 @@ class MockPostgresServer {
   private handleClient(socket: net.Socket): void {
     this.connections.add(socket);
     socket.on("close", () => this.connections.delete(socket));
+    socket.on("error", () => {});
 
     let startupDone = false;
     let buf = Buffer.alloc(0);
@@ -64,6 +67,15 @@ class MockPostgresServer {
         buf = buf.subarray(frameLen);
 
         if (!startupDone) {
+          // Check for SSLRequest (len 8, code 80877103)
+          if (frameLen === 8 && frame.readUInt32BE(4) === 80877103) {
+            this.sslRequestsHandled += 1;
+            // Reply with 'N' (SSL not supported)
+            socket.write(Buffer.from([0x4e]));
+            continue;
+          }
+
+          // Real StartupMessage
           startupDone = true;
           // Send AuthenticationOk ('R' + len 8 + auth type 0)
           const authOk = Buffer.from([0x52, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00]);
@@ -82,13 +94,23 @@ class MockPostgresServer {
           compHeader[0] = 0x43; // 'C'
           compHeader.writeUInt32BE(compLen, 1);
 
-          // ReadyForQuery
-          const ready = Buffer.from([0x5a, 0x00, 0x00, 0x00, 0x05, 0x54]); // 'T' inside transaction
+          // ReadyForQuery ('Z' + len 5 + status byte)
+          // If query is COMMIT, transaction status is 'I' (idle); otherwise 'T'
+          const txStatus = query.trim().toUpperCase() === "COMMIT" ? 0x49 : 0x54;
+          const ready = Buffer.from([0x5a, 0x00, 0x00, 0x00, 0x05, txStatus]);
           socket.write(Buffer.concat([compHeader, tag, ready]));
         }
       }
     });
   }
+}
+
+/** Helper to encode an SSLRequest packet (8 bytes, code 80877103). */
+function encodeSSLRequest(): Buffer {
+  const packet = Buffer.alloc(8);
+  packet.writeUInt32BE(8, 0);
+  packet.writeUInt32BE(80877103, 4);
+  return packet;
 }
 
 /** Helper to encode a PostgreSQL startup packet. */
@@ -111,7 +133,7 @@ function encodeQueryPacket(sql: string): Buffer {
   return packet;
 }
 
-describe("CutProxy", () => {
+describe("CutProxy Wire Protocol Tests", () => {
   let mockPostgres: MockPostgresServer;
   let proxy: CutProxy | null = null;
 
@@ -133,6 +155,7 @@ describe("CutProxy", () => {
     });
 
     const client = net.connect(proxy.port, "127.0.0.1");
+    client.resume();
 
     await new Promise<void>((resolve) => client.once("connect", resolve));
 
@@ -140,7 +163,6 @@ describe("CutProxy", () => {
     client.write(encodeQueryPacket("BEGIN"));
     client.write(encodeQueryPacket("SELECT 1"));
 
-    // Wait briefly for queries to be processed
     await new Promise((r) => setTimeout(r, 100));
 
     expect(mockPostgres.receivedQueries).toEqual(["BEGIN", "SELECT 1"]);
@@ -149,7 +171,41 @@ describe("CutProxy", () => {
     client.destroy();
   });
 
-  it("mode 'after_forward': delivers COMMIT upstream, then tears down downstream before response", async () => {
+  it("handles SSL negotiation: forwards SSLRequest, relays 'N' refusal, and transparently handles subsequent StartupMessage", async () => {
+    mockPostgres = await MockPostgresServer.start();
+    proxy = await CutProxy.start({
+      mode: "after_forward",
+      upstreamPort: mockPostgres.port,
+    });
+
+    const client = net.connect(proxy.port, "127.0.0.1");
+    let sslRefusalReceived = false;
+
+    client.on("data", (chunk: Buffer) => {
+      if (chunk[0] === 0x4e) {
+        sslRefusalReceived = true;
+      }
+    });
+
+    await new Promise<void>((resolve) => client.once("connect", resolve));
+
+    client.write(encodeSSLRequest());
+
+    await new Promise((r) => setTimeout(r, 50));
+    expect(sslRefusalReceived).toBe(true);
+    expect(mockPostgres.sslRequestsHandled).toBe(1);
+
+    client.write(encodeStartupPacket());
+    client.write(encodeQueryPacket("BEGIN"));
+    client.write(encodeQueryPacket("SELECT 2"));
+
+    await new Promise((r) => setTimeout(r, 100));
+    expect(mockPostgres.receivedQueries).toEqual(["BEGIN", "SELECT 2"]);
+
+    client.destroy();
+  });
+
+  it("mode 'after_forward': delivers COMMIT upstream, severs client, and confirms full response cycle settlement", async () => {
     mockPostgres = await MockPostgresServer.start();
     proxy = await CutProxy.start({
       mode: "after_forward",
@@ -174,22 +230,19 @@ describe("CutProxy", () => {
     client.write(encodeQueryPacket("INSERT INTO test VALUES (1)"));
     client.write(encodeQueryPacket("COMMIT"));
 
-    // Must resolve deterministically once the cut happens
-    await proxy.commitSeen;
-
+    await proxy.commitCut;
     expect(proxy.cutCount).toBe(1);
 
-    // Wait briefly to ensure mock server has flushed all received packets
-    await new Promise((r) => setTimeout(r, 50));
+    const outcome = await proxy.serverSettled;
+    expect(outcome.status).toBe("committed");
+    expect(outcome.tag).toBe("COMMIT");
+    expect(outcome.completedCycle).toBe(true);
 
-    // The server DID receive the COMMIT
-    expect(mockPostgres.receivedQueries).toContain("COMMIT");
-
-    // But the client connection was destroyed
     expect(clientDisconnected).toBe(true);
+    expect(mockPostgres.receivedQueries).toContain("COMMIT");
   });
 
-  it("mode 'before_forward': destroys both sockets immediately without delivering COMMIT", async () => {
+  it("mode 'before_forward': severs both sockets immediately without delivering COMMIT", async () => {
     mockPostgres = await MockPostgresServer.start();
     proxy = await CutProxy.start({
       mode: "before_forward",
@@ -213,29 +266,161 @@ describe("CutProxy", () => {
     client.write(encodeQueryPacket("BEGIN"));
     client.write(encodeQueryPacket("INSERT INTO test VALUES (2)"));
 
-    // Wait until server has received the prior queries before issuing COMMIT
     await new Promise((r) => setTimeout(r, 50));
     expect(mockPostgres.receivedQueries).toEqual(["BEGIN", "INSERT INTO test VALUES (2)"]);
 
     client.write(encodeQueryPacket("COMMIT"));
 
-    // Must resolve deterministically
-    await proxy.commitSeen;
-
+    await proxy.commitCut;
     expect(proxy.cutCount).toBe(1);
 
-    // Wait for client socket close event to fire
+    const outcome = await proxy.serverSettled;
+    expect(outcome.status).toBe("rolled_back");
+
     await new Promise<void>((resolve) => {
       if (clientDisconnected) return resolve();
       client.once("close", () => resolve());
     });
-
-    // The server NEVER received the COMMIT
-    expect(mockPostgres.receivedQueries).toEqual(["BEGIN", "INSERT INTO test VALUES (2)"]);
-    expect(mockPostgres.receivedQueries).not.toContain("COMMIT");
-
-    // And the client connection was destroyed
     expect(clientDisconnected).toBe(true);
+
+    expect(mockPostgres.receivedQueries).not.toContain("COMMIT");
+  });
+
+  it("reliably accounts for multiple cuts on a single proxy instance", async () => {
+    mockPostgres = await MockPostgresServer.start();
+    proxy = await CutProxy.start({
+      mode: "after_forward",
+      upstreamPort: mockPostgres.port,
+    });
+
+    // Client 1 connects and commits
+    const client1 = net.connect(proxy.port, "127.0.0.1");
+    client1.resume();
+    client1.on("error", () => {});
+    await new Promise<void>((r) => client1.once("connect", r));
+
+    client1.write(encodeStartupPacket());
+    client1.write(encodeQueryPacket("BEGIN"));
+    client1.write(encodeQueryPacket("INSERT INTO test VALUES (10)"));
+    client1.write(encodeQueryPacket("COMMIT"));
+
+    // Wait for first cut to be processed
+    await proxy.commitCut;
+    expect(proxy.cutCount).toBe(1);
+    expect(proxy.cuts.length).toBe(1);
+
+    const outcome1 = await proxy.cuts[0].serverSettled;
+    expect(outcome1.status).toBe("committed");
+
+    // Client 2 connects and commits through the same proxy instance
+    const client2 = net.connect(proxy.port, "127.0.0.1");
+    client2.resume();
+    client2.on("error", () => {});
+    await new Promise<void>((r) => client2.once("connect", r));
+
+    client2.write(encodeStartupPacket());
+    client2.write(encodeQueryPacket("BEGIN"));
+    client2.write(encodeQueryPacket("INSERT INTO test VALUES (20)"));
+    client2.write(encodeQueryPacket("COMMIT"));
+
+    // Await second cut
+    const cut2 = await proxy.waitForCut(1);
+    await cut2.commitCut;
+    expect(proxy.cutCount).toBe(2);
+    expect(proxy.cuts.length).toBe(2);
+
+    const outcome2 = await cut2.serverSettled;
+    expect(outcome2.status).toBe("committed");
+
+    // stop() must gracefully wait for all cuts
+    await proxy.stop(1000);
+  });
+
+  it("handles refused upstream honestly: does not increment cutCount on refused connection", async () => {
+    proxy = await CutProxy.start({
+      mode: "after_forward",
+      upstreamPort: 1, // Port 1 is unreachable
+    });
+
+    const client = net.connect(proxy.port, "127.0.0.1");
+    client.resume();
+
+    await new Promise<void>((resolve) => client.once("connect", resolve));
+
+    client.write(encodeStartupPacket());
+    client.write(encodeQueryPacket("COMMIT"));
+
+    const outcome = await proxy.serverSettled;
+    expect(outcome.status).toBe("refused");
+    expect(proxy.cutCount).toBe(0);
+
+    client.destroy();
+  });
+
+  it("supports multiple valid frames packaged in a single TCP write without false rejection", async () => {
+    mockPostgres = await MockPostgresServer.start();
+    // Set maxFrameSize small (200 bytes), but buffer large (1024 bytes)
+    proxy = await CutProxy.start({
+      mode: "after_forward",
+      upstreamPort: mockPostgres.port,
+      maxFrameSize: 200,
+      maxBufferSize: 2048,
+    });
+
+    const client = net.connect(proxy.port, "127.0.0.1");
+    client.resume();
+    await new Promise<void>((resolve) => client.once("connect", resolve));
+
+    // Three valid frames whose COMBINED length is ~250 bytes (> maxFrameSize 200),
+    // but each INDIVIDUAL frame is ~80 bytes (<= maxFrameSize 200).
+    const frame1 = encodeQueryPacket("SELECT 1000");
+    const frame2 = encodeQueryPacket("SELECT 2000");
+    const frame3 = encodeQueryPacket("SELECT 3000");
+    const combined = Buffer.concat([encodeStartupPacket(), frame1, frame2, frame3]);
+
+    client.write(combined);
+
+    await new Promise((r) => setTimeout(r, 100));
+
+    expect(mockPostgres.receivedQueries).toEqual(["SELECT 1000", "SELECT 2000", "SELECT 3000"]);
+    client.destroy();
+  });
+
+  it("rejects an individual frame that exceeds maxFrameSize", async () => {
+    mockPostgres = await MockPostgresServer.start();
+    proxy = await CutProxy.start({
+      mode: "after_forward",
+      upstreamPort: mockPostgres.port,
+      maxFrameSize: 100, // 100-byte frame limit
+    });
+
+    const client = net.connect(proxy.port, "127.0.0.1");
+    client.resume();
+    let clientError = false;
+
+    client.on("close", () => {
+      clientError = true;
+    });
+    client.on("error", () => {
+      clientError = true;
+    });
+
+    await new Promise<void>((resolve) => client.once("connect", resolve));
+
+    client.write(encodeStartupPacket());
+    await new Promise((r) => setTimeout(r, 50));
+
+    // Send a single frame claiming to be 500 bytes (> 100 bytes limit)
+    const bigHeader = Buffer.alloc(5);
+    bigHeader[0] = 0x51; // 'Q'
+    bigHeader.writeUInt32BE(500, 1);
+    client.write(bigHeader);
+
+    await new Promise<void>((resolve) => {
+      if (clientError) return resolve();
+      client.once("close", () => resolve());
+    });
+    expect(clientError).toBe(true);
   });
 
   it("handles variations like 'COMMIT;' and 'COMMIT WORK;'", async () => {
@@ -243,15 +428,20 @@ describe("CutProxy", () => {
     proxy = await CutProxy.start("after_forward", mockPostgres.port);
 
     const client = net.connect(proxy.port, "127.0.0.1");
+    client.resume();
+    client.on("error", () => {});
+    client.on("close", () => {});
     await new Promise<void>((resolve) => client.once("connect", resolve));
 
     client.write(encodeStartupPacket());
-    client.write(encodeQueryPacket("commit; "));
+    client.write(encodeQueryPacket("commit work; "));
 
-    await proxy.commitSeen;
+    await proxy.commitCut;
     expect(proxy.cutCount).toBe(1);
 
-    await new Promise((r) => setTimeout(r, 50));
-    expect(mockPostgres.receivedQueries).toContain("commit; ");
+    const outcome = await proxy.serverSettled;
+    expect(outcome.status).toBe("committed");
+
+    expect(mockPostgres.receivedQueries).toContain("commit work; ");
   });
 });
