@@ -88,7 +88,9 @@ class MockPostgresServer {
           this.receivedQueries.push(query);
 
           // CommandComplete ('C' + len + tag + null)
-          const tag = Buffer.from(`${query}\0`, "utf8");
+          // PostgreSQL returns canonical command tags, not the original SQL.
+          const isCommit = /^\s*commit(?:\s+(?:work|transaction))?\s*;?\s*$/i.test(query);
+          const tag = Buffer.from(`${isCommit ? "COMMIT" : query}\0`, "utf8");
           const compLen = 4 + tag.length;
           const compHeader = Buffer.alloc(5);
           compHeader[0] = 0x43; // 'C'
@@ -96,7 +98,7 @@ class MockPostgresServer {
 
           // ReadyForQuery ('Z' + len 5 + status byte)
           // If query is COMMIT, transaction status is 'I' (idle); otherwise 'T'
-          const txStatus = query.trim().toUpperCase() === "COMMIT" ? 0x49 : 0x54;
+          const txStatus = isCommit ? 0x49 : 0x54;
           const ready = Buffer.from([0x5a, 0x00, 0x00, 0x00, 0x05, txStatus]);
           socket.write(Buffer.concat([compHeader, tag, ready]));
         }

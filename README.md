@@ -47,8 +47,8 @@ No sleeps, no timing probabilities. The cut is synchronized on the wire protocol
 
 * **`after_forward` (Ambiguous Commit):**  
   The `COMMIT` frame is delivered to PostgreSQL, and the client socket is immediately severed before any server response can return. The client experiences an abrupt disconnection. Simultaneously, the proxy monitors PostgreSQL's upstream response cycle until both `CommandComplete 'COMMIT'` and `ReadyForQuery 'I'` are received, establishing authoritative server settlement (`proxy.serverSettled` confirms `{ status: "committed", tag: "COMMIT", completedCycle: true }`).
-* **`before_forward` (Lost Commit):**  
-  Both connections are severed immediately without forwarding the `COMMIT` frame. PostgreSQL never receives `COMMIT` and automatically rolls back when the connection drops. `proxy.serverSettled` confirms `{ status: "rolled_back" }`.
+* **`before_forward` (Lost Commit):**
+  The client connection is severed without forwarding the `COMMIT` frame, and the proxy half-closes its upstream write side. PostgreSQL never receives `COMMIT`. `proxy.commitCut` resolves as soon as the local cut is complete; `proxy.serverSettled` does not report `{ status: "rolled_back" }` until PostgreSQL closes the upstream connection after observing EOF and completing transaction cleanup.
 
 ---
 
@@ -64,7 +64,7 @@ A single `CutProxy` instance accurately tracks multiple cuts across sequential c
 
 ## Scope & Limitations
 
-* **Simple Query Protocol Only:** Matches standalone Simple Query (`'Q'`) frames containing `COMMIT`, `COMMIT;`, `COMMIT WORK`, or `COMMIT TRANSACTION` (case-insensitive, trailing semicolons and whitespace stripped).
+* **Simple Query Protocol Only:** Matches standalone Simple Query (`'Q'`) frames containing `COMMIT`, `COMMIT;`, `COMMIT WORK`, or `COMMIT TRANSACTION`, using ASCII keyword casing and PostgreSQL scanner whitespace (space, tab, newline, carriage return, form feed), with optional trailing semicolons. Unicode lookalikes and other whitespace are forwarded unchanged, not treated as COMMIT.
 * **No Extended Query Protocol:** Does not parse Extended Query Protocol frames (`Parse` `'P'`, `Bind` `'B'`, `Execute` `'E'`, `Sync` `'S'`). Most Node.js drivers (such as `pg` / `node-postgres`) use Simple Query Protocol for `client.query("COMMIT")` or transaction blocks.
 * **No Multi-Statement Splitting:** Does not parse or split compound multi-statement frames (e.g. `COMMIT; SELECT 1`).
 * **Unencrypted Plaintext Only:** The proxy must inspect plaintext SQL frames. It handles PostgreSQL startup negotiation by relaying or responding with `'N'` (SSL refused) so standard drivers fall back to plaintext. It cannot inspect TLS-encrypted sessions.
@@ -75,7 +75,7 @@ A single `CutProxy` instance accurately tracks multiple cuts across sequential c
 ## Node.js Compatibility
 
 * **Production Runtime:** Node.js `>= 18.0.0`. Pure `node:net` with zero runtime dependencies.
-* **Development & Test Suite:** Node.js `>= 20.0.0` or `>= 22.0.0` (required by modern Vitest 3/5 and Vite toolchains).
+* **Development & Test Suite:** Node.js `^22.12.0 || ^24.0.0 || >=26.0.0`, matching the locked Vitest 5.1.0 engine requirement. Node 20 and Node 22 before 22.12 are not supported for development. This is separate from the published library's Node 18 runtime support.
 
 ---
 
@@ -216,8 +216,8 @@ Creates and starts a proxy listener.
 | `upstreamHost` | `string` | `"127.0.0.1"` | Host of the target PostgreSQL server. |
 | `listenHost` | `string` | `"127.0.0.1"` | Local network interface for the proxy listener. |
 | `listenPort` | `number` | `0` | Port to bind proxy to (`0` assigns an ephemeral free port). |
-| `maxFrameSize` | `number` | `16777216` | Maximum allowed individual client frame length (16MB). |
-| `maxBufferSize` | `number` | `67108864` | Maximum allowed unparsed buffer accumulation (64MB). |
+| `maxFrameSize` | `number` | `16777216` | Maximum individual typed frontend or backend frame size, including its header (16MB). Startup packets have a separate 10KB protocol limit. |
+| `maxBufferSize` | `number` | `67108864` | Maximum retained unparsed backlog per direction (64MB), checked after consuming complete frames. Coalesced complete frames do not count as backlog. |
 | `sslMode` | `"forward" \| "refuse"` | `"forward"` | Whether to forward `SSLRequest` upstream or refuse directly with `'N'`. |
 
 ### Properties & Methods
@@ -229,19 +229,33 @@ Creates and starts a proxy listener.
 * **`proxy.cut(index)`**: `CutRecord | undefined`  
   Retrieves an executed cut record by index.
 * **`proxy.waitForCut(index)`**: `Promise<CutRecord>`  
-  Returns a promise for cut `#index`, resolving when that cut is triggered.
-* **`proxy.commitCut`**: `Promise<void>`  
-  Resolves the exact instant the first client socket cut is executed. (Alias: `proxy.commitSeen`).
-* **`proxy.serverSettled`**: `Promise<ServerCommitOutcome>`  
-  Resolves with the server-side outcome of the first cut:
+  Returns a promise for cut `#index`, resolving when that cut is triggered. Concurrent callers for the same index all receive the same record. Rejects invalid indices and rejects pending waits when shutdown begins.
+* **`proxy.commitCut`**: `Promise<void>`
+  Resolves the exact instant the first client socket cut is executed. (Alias: `proxy.commitSeen`.) If shutdown begins before any cut, it rejects with a terminal no-cut error instead of remaining pending.
+* **`proxy.serverSettled`**: `Promise<ServerCommitOutcome>`
+  Resolves with the server-side outcome of the first cut, or with `{ status: "error" }` if shutdown occurs before any cut:
   * `{ status: "committed", tag: "COMMIT", completedCycle: true }` in `after_forward` when PostgreSQL acknowledges the commit.
-  * `{ status: "rolled_back" }` in `before_forward`.
+  * `{ status: "rolled_back" }` in `before_forward` only after PostgreSQL closes the upstream connection, proving it observed the disconnect and completed transaction cleanup.
   * `{ status: "refused", error: string }` if upstream PostgreSQL was unreachable.
-  * `{ status: "error", error: string }` if PostgreSQL returned an `ErrorResponse`.
+  * `{ status: "error", error: string }` if PostgreSQL returns an `ErrorResponse`, a malformed/oversized response, a cycle without exact `COMMIT` plus idle `ReadyForQuery`, or the connection/shutdown interrupts completion.
 * **`proxy.cutCount`**: `number`  
   Total number of times a `COMMIT` frame was intercepted and cut.
 * **`proxy.stop(gracePeriodMs?)`**: `Promise<void>`  
-  Closes the proxy server and terminates active sockets. If any `after_forward` commits are in flight, waits up to `gracePeriodMs` (default 2000ms) for all pending cuts to settle before closing upstream.
+  Closes the proxy server and terminates active sockets. If any cuts are in flight, waits up to `gracePeriodMs` (default 2000ms) for all pending cuts to settle before closing upstream.
+
+---
+
+## Running the development tests
+
+```sh
+npm ci
+npm run build
+npm test
+```
+
+The live tests require a disposable PostgreSQL instance (default `127.0.0.1:55432`, database/user/password `postgres`). They create and drop a uniquely named fixture table. Override with `TEST_PG_HOST`, `TEST_PG_PORT`, `TEST_PG_USER`, `TEST_PG_PASSWORD`, and `TEST_PG_DATABASE`, or use `TEST_PG_URL`. URL configuration takes precedence and uses PostgreSQL's default port 5432 when no port is specified (or `PGPORT` if set).
+
+The integration tests require a **plaintext TCP** endpoint, for example `postgres://user:password@127.0.0.1:55432/db?sslmode=disable`. TLS-requiring URLs and Unix-socket endpoints are rejected, not silently downgraded. Connection configuration and raw driver errors are intentionally omitted from setup failure output to avoid leaking credentials.
 
 ---
 
